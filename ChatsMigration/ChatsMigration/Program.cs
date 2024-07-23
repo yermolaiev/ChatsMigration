@@ -3,14 +3,16 @@ using ChatsMigration.Models;
 using MongoDB.Driver;
 using Newtonsoft.Json;
 using Npgsql;
+using System.Diagnostics.Metrics;
 using System.Net.Http.Headers;
 
 class Program
 {
-    private static readonly string PostgresConnectionString = "Host=195.201.30.220;Port=5435;Database=inura;Username=postgres;Password=12345";
+    private static readonly string PostgresConnectionString = "Host=49.13.130.48;Port=5435;Database=inura;Username=postgres;Password=12345";
     private static readonly string MongoDBConnectionString = "mongodb+srv://Yermolaiev:SOE1q5BJS8ooD9SNxigC1@inura.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000";
     private static readonly string OpenAIApiKey = "sk-inura-chattt-d6X4iIRezo8MEqRFYszZT3BlbkFJckmC2B4mT4DRaDS1ACDv";
 
+    static int counOfSavedThreads = 1;
     public static async Task Main(string[] args)
     {
         Console.WriteLine("Press any button...");
@@ -20,30 +22,40 @@ class Program
         const int CounterStepSize = 1000;
         int i = 0;
         int dataCount = 0;
+
         do
         {
-
             var userThreadPairs = await GetUserThreadPairsFromPostgres(CounterStepSize, i);
             dataCount = userThreadPairs.Count;
 
-            foreach (var pair in userThreadPairs)
-            {
-                var (userId, threadId) = pair;
-                if (threadId != null)
-                {
-                    var chats = await GetChatsFromOpenAI(threadId);
-                    if (chats.Any())
-                    {
-                        await SaveChatsToMongoDB(userId, chats);
-                    }
-                }
-            }
+            var batches = SplitList(userThreadPairs.Where(x => x.ThreadId!= null).ToList(), 1);
+
+            var tasks = batches.Select((batch, index) => ProcessBatch(batch)).ToList();
+            await Task.WhenAll(tasks);
+
             i++;
 
         } while (dataCount == CounterStepSize);
 
         Console.WriteLine("Data migration completed.");
         Console.ReadKey();
+    }
+
+    private static async Task ProcessBatch(List<(int UserId, string ThreadId)> batch)
+    {
+        foreach (var (userId, threadId) in batch)
+        {
+            if (threadId != null)
+            {
+                var chats = await GetChatsFromOpenAIAsync(threadId);
+                if (chats.Any())
+                {
+                    await SaveChatsToMongoDBAsync(userId, chats);
+                    Console.WriteLine($"{counOfSavedThreads}) {DateTime.Now.ToString("HH:mm:ss")} Thread with id: {threadId} saved");
+                    counOfSavedThreads++;
+                }
+            }
+        }
     }
 
     private static async Task<List<(int UserId, string ThreadId)>> GetUserThreadPairsFromPostgres(int counterStepSize, int interation)
@@ -77,12 +89,13 @@ class Program
         return userThreadPairs;
     }
 
-    private static async Task<List<MessageMongoEntity>> GetChatsFromOpenAI(string threadId)
+    private static async Task<List<MessageMongoEntity>> GetChatsFromOpenAIAsync(string threadId)
     {
         var httpClient = new HttpClient();
+        httpClient.Timeout = TimeSpan.FromSeconds(20);
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", OpenAIApiKey);
         httpClient.DefaultRequestHeaders.Add("OpenAI-Beta", "assistants=v2");
-        httpClient.DefaultRequestHeaders.Accept.Add(System.Net.Http.Headers.MediaTypeWithQualityHeaderValue.Parse("application/json"));
+        httpClient.DefaultRequestHeaders.Accept.Add(MediaTypeWithQualityHeaderValue.Parse("application/json"));
 
         var chats = new List<MessageMongoEntity>();
         var hasMore = true;
@@ -90,47 +103,89 @@ class Program
         while (hasMore)
         {
             HttpResponseMessage response;
-            if (afterMessageId == null)
+            var isCompleated = false;
+            const int MaxCountOfTry = 5;
+            int countOfTry = 0;
+            while (!isCompleated && countOfTry < MaxCountOfTry)
             {
-                 response = await httpClient.GetAsync($"https://api.openai.com/v1/threads/{threadId}/messages");
-                if (!response.IsSuccessStatusCode)
+                countOfTry++;
+                try
                 {
-                    break;
-                }
-            }
-            else
-            {
-                response = await httpClient.GetAsync($"https://api.openai.com/v1/threads/{threadId}/messages?after={afterMessageId}");
-                if (!response.IsSuccessStatusCode)
-                {
-                    break;
-                }
-            }
-        
+                    if (afterMessageId == null)
+                    {
+                        response = await httpClient.GetAsync($"https://api.openai.com/v1/threads/{threadId}/messages");
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            isCompleated = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        response = await httpClient.GetAsync($"https://api.openai.com/v1/threads/{threadId}/messages?after={afterMessageId}");
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            isCompleated = true;
+                            break;
+                        }
+                    }
 
-            var content = await response.Content.ReadAsStringAsync();
-            var responseModel = JsonConvert.DeserializeObject<ListMessagesResponse>(content);
-            hasMore = responseModel.HasMore;
-            var entities = responseModel.Data.ToEntities();
-            afterMessageId = entities.LastOrDefault()?.MessageId;
+                    var content = await response.Content.ReadAsStringAsync();
+                    var responseModel = JsonConvert.DeserializeObject<ListMessagesResponse>(content);
+                    hasMore = responseModel.HasMore;
+                    var entities = responseModel.Data.ToEntities();
+                    chats.AddRange(entities);
+                    afterMessageId = entities.LastOrDefault()?.MessageId;
+                    isCompleated = true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.ToString());
+                }
+            }
         }
-
-        Console.WriteLine($"Thread with id: {threadId} saved");
 
         return chats;
     }
 
-    private static async Task SaveChatsToMongoDB(int userId, List<MessageMongoEntity> chats)
+    private static async Task SaveChatsToMongoDBAsync(int userId, List<MessageMongoEntity> chats)
     {
         var client = new MongoClient(MongoDBConnectionString);
         var database = client.GetDatabase("Inura");
         var collection = database.GetCollection<MessageMongoEntity>("MessageMongoEntity");
         chats.ForEach(x => 
         { 
-            x.UserId = userId; 
+            x.UserId = (int)userId; 
             x.IsActive = true; 
         });
-        await collection.InsertManyAsync(chats);
+
+        try
+        {
+            await collection.InsertManyAsync(chats);
+        }
+        catch (Exception e)
+        {
+            try
+            {
+                foreach (var message in chats)
+                {
+                    await collection.InsertOneAsync(message);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.ToString());
+            }
+        }
+    }
+
+    private static List<List<T>> SplitList<T>(List<T> list, int n)
+    {
+        var k = (int)Math.Ceiling(list.Count / (double)n);
+        return list.Select((x, i) => new { Index = i, Value = x })
+                   .GroupBy(x => x.Index / k)
+                   .Select(g => g.Select(x => x.Value).ToList())
+                   .ToList();
     }
 }
 
